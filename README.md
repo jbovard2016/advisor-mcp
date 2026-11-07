@@ -4,16 +4,17 @@
 
 Implemented with the stable MCP TypeScript SDK v2 (`@modelcontextprotocol/server` 2.x, MCP spec 2026-07-28) and cross-checked against Claude Code 2.1.302 and MCP 2025-era clients. See `docs/architecture.md` for the research notes and design rationale.
 
-The advisor is deliberately read-only. It cannot inspect the workspace, execute commands, or edit files. The calling agent supplies a compact evidence pack and remains responsible for verifying and applying the advice.
+The advisor is deliberately read-only. It cannot execute commands or edit files. The calling agent supplies a compact evidence pack; optionally the server adds a Claude Code transcript read from disk. The advisor receives only that evidence, never filesystem or command tools. The caller remains responsible for verifying and applying the advice.
 
 ## Why this differs from Claude Code's built-in advisor
 
 Claude Code implements the advisor as a **server-side tool**. The API automatically passes the executor's full conversation, including tool calls and results, to a second model inside the same model request. The client cannot construct or alter that advisor context.
 
-An MCP server is outside the host model request. It cannot see the host's full transcript. `advisor-mcp` therefore makes context explicit:
+An MCP server is outside the host model request. It does not receive the host's transcript automatically. `advisor-mcp` makes context explicit and offers opt-in disk transcript access:
 
 - the agent chooses when to consult;
 - the agent sends goal, state, evidence, constraints, and the exact question;
+- when enabled, the server includes the first user message and newest transcript turns, with `state` as the agent's summary on top;
 - the server keeps a lightweight session across consults;
 - every advisor call returns structured guidance, not actions.
 
@@ -60,6 +61,7 @@ Key properties:
 - required: `session_id`, `kind`, `question`
 - context: `goal`, `state`, `attempt`, `expected_outcome`, `constraints`, `evidence`, `context`, `options`, `files_touched`
 - control: `style`, `include_history`, `max_history_messages`
+- optional disk context: `transcript_path` (requires server-side enablement below)
 
 `kind` is one of `plan`, `stuck`, `review`, `risk`, `decision`, or `handoff`.
 
@@ -112,7 +114,8 @@ node dist/index.js
 | --- | --- | --- |
 | `ADVISOR_MAX_OUTPUT_TOKENS` | `1200` | Advisor output cap per call. |
 | `ADVISOR_TIMEOUT_MS` | `60000` | Provider timeout per attempt. |
-| `ADVISOR_MAX_CONTEXT_CHARS` | `120000` | Evidence budget before truncation. |
+| `ADVISOR_MAX_CONTEXT_TOKENS` | `30000` | Estimated token budget for the user evidence prompt. |
+| `ADVISOR_MAX_CONTEXT_CHARS` | `120000` | Legacy setting: divided by 4 to derive the token budget when the new setting is absent. |
 | `ADVISOR_MAX_CALLS_PER_SESSION` | `12` | Advisor calls allowed per session. |
 | `ADVISOR_MAX_CALLS_PER_MINUTE` | `30` | Advisor calls allowed per session per minute. |
 | `ADVISOR_STYLE` | `brief` | Default advice style: `brief` or `detailed`. |
@@ -120,6 +123,55 @@ node dist/index.js
 | `ADVISOR_DATA_DIR` | `~/.advisor-mcp` | Session directory when file storage is enabled. |
 
 Use `ADVISOR_STORE=file` when the host may restart the MCP process between consults. File names are hashed, directory and file permissions are restricted, but stored prompts and advice are still plaintext on disk. Choose `memory` for sensitive work.
+
+### Claude Code transcript access (opt-in)
+
+Enable this only when the configured advisor endpoint may receive the session's contents:
+
+```bash
+export ADVISOR_TRANSCRIPT_ENABLED=true
+# Optional: discover the newest session for the MCP server's working directory.
+export ADVISOR_TRANSCRIPT_AUTO_DISCOVER=true
+# Optional: defaults to ~/.claude/projects under the server user's home.
+export ADVISOR_TRANSCRIPT_PROJECTS_DIR=/path/to/.claude/projects
+export ADVISOR_MAX_CONTEXT_TOKENS=30000
+```
+
+Both enablement and auto-discovery default to `false`. For a precise session, pass an absolute `transcript_path` to `consult_advisor`; it overrides auto-discovery. Supply the agent's own summary in `state`. Without a path or enabled auto-discovery, the server uses only the caller's evidence pack.
+
+```json
+{
+  "session_id": "my-task",
+  "kind": "review",
+  "question": "What should I verify before finishing?",
+  "state": "Implemented the parser; focused tests pass.",
+  "transcript_path": "/path/to/.claude/projects/encoded-project/session-id.jsonl"
+}
+```
+
+Auto-discovery selects the most recently modified **direct `.jsonl` file** in the directory derived from the server's absolute working directory, replacing non-alphanumeric characters with `-`. It excludes nested subagent files and checks recorded `cwd` values. Launch the MCP process in the intended project directory. It cannot infer a remote HTTP caller's working directory. Concurrent sessions in one directory are ambiguous: use an explicit path to avoid selecting the wrong session.
+
+Only regular `.jsonl` files inside the configured projects root are accepted; resolved paths and symlinks cannot escape that root. Reads take a size-bounded snapshot (maximum 64 MiB), never write to Claude Code folders, and fail visibly on missing, inaccessible or malformed files. An unfinished final JSONL record is omitted. Do not enable this on a shared HTTP server unless all callers are trusted to select transcripts under that root. Use a narrower root for explicit-path access if needed.
+
+Text, tool calls and text tool results are included as **untrusted evidence**. Metadata, sidechain records, thinking/signatures and image payloads are excluded. Secrets are redacted before trimming, including configured credentials and tool names. Redaction is heuristic; review the destination and avoid secrets in sessions.
+
+The budget estimates tokens as `ceil(UTF-8 bytes / 3)`; it is not a model-specific tokenizer or an exact context-window guarantee. It covers the user evidence prompt, not the fixed system/schema instructions, provider framing or output. The legacy character setting is converted using 4 characters per token; it no longer promises an exact character cap. The new variable takes precedence. With disk context, the complete first user message, summary and question are preserved; if they cannot fit, the call fails and asks for a larger budget. Remaining room prioritizes recent transcript content; oversized turns can be clipped, with an omission notice. Context/history controls still govern the caller's excerpts and prior advisor turns, independently of disk access.
+
+**Verified on this machine, 7 November 2026:** read-only inspection of
+`C:\Users\jonbo\.claude\projects\C--Users-jonbo-orca-workspaces-experiment\4bd85505-ef5a-4c35-9dc9-505158556c5c.jsonl`
+found Claude Code `2.1.319` records, a recorded `cwd` matching that encoded directory, and newline-delimited JSON. The sample contained `user`/`assistant` records with `message.role` and `message.content` (string or block array), `text`, `tool_use` (`id`, `name`, `input`) and `tool_result` (`tool_use_id`, `content`, `is_error`) blocks, plus metadata and thinking blocks. The new parser retained 81 messages, including 32 tool results, in a local read-only check. No private transcript content was copied into this repository or sent to a provider. Other Claude Code versions, OS layouts, custom config homes and long-path directory encodings remain unverified; use the configurable root and explicit path when discovery differs.
+
+### Ordered model fallback
+
+```bash
+export ADVISOR_MODELS=first-model,second-model,third-model
+```
+
+`ADVISOR_MODELS` accepts 1-10 comma-separated model IDs in priority order and takes precedence over `ADVISOR_MODEL`. All entries use the same configured provider, base URL and credential, so a model gateway can route them to different backends. Without the list, `ADVISOR_MODEL` keeps its existing behavior.
+
+The next model is tried immediately on HTTP 429, 5xx, 408/409, quota exhaustion (402 or structured `insufficient_quota`/`quota_exceeded` on 400/403), network failures and request/body timeouts. Cancellation, authentication failures and other non-transient errors stop the chain. Each chain entry is attempted once per completion; a single-model configuration retains the existing transient retries. One invalid advice response may trigger a repair completion with the same bounded evidence, starting the chain again. A consult still consumes one session call, although several provider requests may be made.
+
+Successful MCP results include `advisorModel` and, when applicable, `failures: [{ model, reason }]`; the text result lists failed models too. Exhaustion reports all attempted models. Failure reasons use fixed categories/status codes and exclude provider response bodies, credentials and URLs. A shared bad key cannot be repaired by switching models; it remains a terminal error. Worst-case latency grows with the number of models and per-attempt timeout.
 
 **Warning:** do not configure an advisor that is weaker than the executor and expect a quality lift. The pattern works because the advisor contributes stronger judgment at selected moments.
 
@@ -375,16 +427,18 @@ npm run check
 
 Tests use a fake provider and local HTTP servers; they do not call a paid model.
 
-Verified locally:
+Original upstream verification (before this fork's changes):
 
 - 43 unit, integration, provider, stdio, HTTP, and persistence tests pass;
 - the built server completes a full MCP call under Claude Code 2.1.302;
 - a raw 2025-06-18 handshake also lists all five tools successfully;
 - the HTTP runner serves `/healthz` and rejects unauthenticated `/mcp` with 401.
 
+JON-2274 verification is recorded in [docs/jon-2274-verification.md](docs/jon-2274-verification.md). Reproduce the built-server local stub check with `npm run build` followed by `node scripts/check-transcript-fallback.mjs`. It uses synthetic transcripts and no paid endpoint.
+
 ## Limitations
 
-- The advisor does not see the full host transcript; context quality depends on the caller.
+- Disk transcript access is opt-in and bounded; context quality still depends on the caller's summary and the selected session.
 - There is no automatic trigger. The host agent decides when to call.
 - Advice is advisory and can be wrong; independent verification is mandatory.
 - A single advisor call runs synchronously from the MCP client's perspective. Hosts may show a pause while it runs.

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 import { AdvisorService } from "../src/advisor.js";
-import type { AdvisorConfig } from "../src/config.js";
+import { loadConfig, type AdvisorConfig } from "../src/config.js";
 import { createAdvisorServer } from "../src/server.js";
 import { MemorySessionStore } from "../src/store.js";
 import type { AdvisorProvider, ProviderRequest, ProviderResponse } from "../src/types.js";
@@ -26,6 +26,7 @@ class StaticProvider implements AdvisorProvider {
 }
 
 const config: AdvisorConfig = {
+  ...loadConfig({ ADVISOR_MODEL: "static-model" }),
   provider: "openai-compatible",
   model: "static-model",
   apiKey: "test",
@@ -34,7 +35,7 @@ const config: AdvisorConfig = {
   tokenParam: "max_completion_tokens",
   maxOutputTokens: 500,
   timeoutMs: 5_000,
-  maxContextChars: 50_000,
+  maxContextTokens: 16_666,
   maxCallsPerSession: 5,
   maxCallsPerMinute: 10,
   dataDir: "/tmp/advisor-test",

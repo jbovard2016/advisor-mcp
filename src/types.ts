@@ -28,6 +28,7 @@ export interface ConsultRequest {
   goal?: string;
   constraints?: string[];
   state?: string;
+  transcriptPath?: string;
   context?: ContextMessage[];
   evidence?: string[];
   options?: string[];
@@ -50,6 +51,7 @@ export interface Advice {
   consultId: string;
   sessionId: string;
   advisorModel: string;
+  failures?: ModelFailure[];
   usage?: Usage;
 }
 
@@ -120,6 +122,12 @@ export interface ProviderResponse {
   text: string;
   model: string;
   usage?: Usage;
+  failures?: ModelFailure[];
+}
+
+export interface ModelFailure {
+  model: string;
+  reason: string;
 }
 
 export interface AdvisorProvider {

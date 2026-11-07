@@ -1,8 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { AdvisorError, AdvisorService } from "../src/advisor.js";
-import type { AdvisorConfig } from "../src/config.js";
+import { loadConfig, type AdvisorConfig } from "../src/config.js";
 import { MemorySessionStore } from "../src/store.js";
+import { ProviderError } from "../src/providers.js";
+import { estimateTokens } from "../src/context-budget.js";
 import type { AdvisorProvider, ProviderRequest, ProviderResponse } from "../src/types.js";
 
 const validAdvice = JSON.stringify({
@@ -31,6 +36,7 @@ class FakeProvider implements AdvisorProvider {
 
 function config(overrides: Partial<AdvisorConfig> = {}): AdvisorConfig {
   return {
+    ...loadConfig({ ADVISOR_MODEL: "fake-advisor" }),
     provider: "openai-compatible",
     model: "fake-advisor",
     apiKey: "test",
@@ -39,7 +45,7 @@ function config(overrides: Partial<AdvisorConfig> = {}): AdvisorConfig {
     tokenParam: "max_completion_tokens",
     maxOutputTokens: 500,
     timeoutMs: 5_000,
-    maxContextChars: 50_000,
+    maxContextTokens: 16_666,
     maxCallsPerSession: 2,
     maxCallsPerMinute: 10,
     dataDir: "/tmp/advisor-test",
@@ -61,6 +67,73 @@ function config(overrides: Partial<AdvisorConfig> = {}): AdvisorConfig {
     ...overrides,
   };
 }
+
+test("opt-in transcript supplies tool evidence absent from the caller and redacts it", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "advisor-transcript-"));
+  try {
+    const path = join(directory, "session.jsonl");
+    await writeFile(path, [
+      { type: "user", message: { role: "user", content: "FIRST USER GOAL" } },
+      { type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", name: "test", id: "t1", input: { command: "npm test" } }] } },
+      { type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "UNSUPPLIED TOOL RESULT sk-abcdefghijklmnopqrstuvwxyz" }] } },
+    ].map((row) => JSON.stringify(row)).join("\n") + "\n");
+    const provider = new FakeProvider(["not JSON " + "x".repeat(12_000), validAdvice]);
+    const service = new AdvisorService(config({ transcriptEnabled: true, transcriptProjectsDir: directory, maxContextTokens: 1000 }), provider, new MemorySessionStore());
+    await service.consult({ sessionId: "transcript", kind: "review", question: "Review evidence", state: "AGENT SUMMARY", transcriptPath: path });
+    const prompt = provider.calls[0]?.user ?? "";
+    assert.match(prompt, /UNSUPPLIED TOOL RESULT/);
+    assert.match(prompt, /FIRST USER GOAL/);
+    assert.ok(prompt.indexOf("AGENT SUMMARY") < prompt.indexOf("FIRST USER GOAL"));
+    assert.doesNotMatch(prompt, /sk-abcdefghijklmnopqrstuvwxyz/);
+    assert.equal(provider.calls[1]?.user, prompt);
+    assert.ok(estimateTokens(provider.calls[1]!.user) <= 1000);
+    const disabled = new AdvisorService(config(), provider, new MemorySessionStore());
+    await assert.rejects(disabled.consult({ sessionId: "disabled", kind: "review", question: "q", transcriptPath: path }), /disabled/i);
+    assert.equal(provider.calls.length, 2);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("keeps fallback failures through repair success and repair failure", async () => {
+  for (const failRepair of [false, true]) {
+    let count = 0;
+    const provider: AdvisorProvider = {
+      name: "repair-fallback",
+      async complete() {
+        count++;
+        if (count === 2 && failRepair) throw new ProviderError("second: HTTP 401");
+        return { text: count === 1 ? "bad JSON" : validAdvice, model: "second", failures: count === 1 ? [{ model: "first", reason: "HTTP 429" }] : [] };
+      },
+    };
+    const service = new AdvisorService(config(), provider, new MemorySessionStore());
+    const consult = service.consult({ sessionId: "repair", kind: "review", question: "q" });
+    if (failRepair) await assert.rejects(consult, /first: HTTP 429/);
+    else assert.deepEqual((await consult).failures, [{ model: "first", reason: "HTTP 429" }]);
+    assert.equal((await service.getSession("repair")).calls, 1);
+  }
+});
+
+test("reports cancellation during initial completion and repair without another attempt", async () => {
+  for (const cancelOn of [1, 2]) {
+    const controller = new AbortController();
+    let calls = 0;
+    const provider: AdvisorProvider = {
+      name: "cancelled",
+      async complete() {
+        calls++;
+        if (calls === cancelOn) {
+          controller.abort();
+          throw new ProviderError("Advisor request was cancelled");
+        }
+        return { text: "bad JSON", model: "model" };
+      },
+    };
+    const service = new AdvisorService(config(), provider, new MemorySessionStore());
+    await assert.rejects(service.consult({ sessionId: "cancel", kind: "review", question: "q" }, controller.signal), (error: unknown) => error instanceof AdvisorError && error.code === "cancelled");
+    assert.equal(calls, cancelOn);
+  }
+});
 
 test("persists session state and usage across consults", async () => {
   const provider = new FakeProvider();
@@ -106,7 +179,8 @@ test("repairs one malformed advisory response", async () => {
     question: "Which option?",
   });
   assert.equal(provider.calls.length, 2);
-  assert.match(provider.calls[1]?.user ?? "", /could not be parsed/);
+  assert.match(provider.calls[1]?.system ?? "", /could not be parsed/);
+  assert.equal(provider.calls[1]?.user, provider.calls[0]?.user);
   assert.equal(advice.summary, "The retry loop is masking the real error.");
 });
 

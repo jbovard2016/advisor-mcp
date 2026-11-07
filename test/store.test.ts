@@ -37,7 +37,8 @@ test("file store persists across instances and hashes session IDs", async () => 
   assert.deepEqual(loaded?.constraints, ["c"]);
 
   const mode = (await stat(join(directory, files[0] ?? ""))).mode & 0o777;
-  assert.equal(mode, 0o600);
+  // Windows reports writable files as 0666; POSIX mode bits do not describe NTFS ACLs.
+  assert.equal(mode, process.platform === "win32" ? 0o666 : 0o600);
   assert.equal(await first.delete(id), true);
   assert.equal(await first.delete(id), false);
 });

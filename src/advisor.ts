@@ -3,6 +3,8 @@ import { AdviceParseError, parseAdviceResponse } from "./advice.js";
 import type { AdvisorConfig } from "./config.js";
 import { buildPrompt } from "./prompt.js";
 import { ProviderError } from "./providers.js";
+import { readTranscript } from "./transcript.js";
+import { redactSecrets } from "./redact.js";
 import type {
   Advice,
   AdvisorProvider,
@@ -10,6 +12,8 @@ import type {
   SessionSnapshot,
   SessionState,
   SessionStore,
+  ProviderResponse,
+  ModelFailure,
 } from "./types.js";
 
 const MAX_STORED_TURNS = 20;
@@ -24,6 +28,7 @@ export class AdvisorError extends Error {
       | "rate_limited"
       | "provider_error"
       | "invalid_response"
+      | "invalid_context"
       | "cancelled",
   ) {
     super(message);
@@ -215,28 +220,39 @@ export class AdvisorService {
         );
       }
 
+      let prompt;
+      try {
+        const transcript = await readTranscript(this.config, request.transcriptPath, signal);
+        prompt = buildPrompt({
+          request,
+          session,
+          style: request.style ?? this.config.defaultAdviceStyle,
+          maxContextTokens: this.config.maxContextTokens,
+          secrets: [this.config.apiKey, this.config.http.token],
+          ...(transcript ? { transcript } : {}),
+        });
+      } catch (error) {
+        throw new AdvisorError(error instanceof Error ? error.message : "Cannot load context", signal?.aborted ? "cancelled" : "invalid_context");
+      }
+
       touch(session, request);
       session.calls += 1;
       session.callTimestamps.push(nowMs);
       session.updatedAt = now();
       await this.store.save(session);
 
-      const prompt = buildPrompt({
-        request,
-        session,
-        style: request.style ?? this.config.defaultAdviceStyle,
-        maxContextChars: this.config.maxContextChars,
-      });
-
       let responseText: string;
       let model: string;
       let usage: Advice["usage"];
+      const failures: ModelFailure[] = [];
       try {
         const result = await this.requestWithRetry(prompt.system, prompt.user, signal);
         responseText = result.text;
         model = result.model;
         usage = result.usage;
+        failures.push(...(result.failures ?? []));
       } catch (error) {
+        if (signal?.aborted) throw new AdvisorError("Advisor request was cancelled", "cancelled");
         if (error instanceof AdvisorError) throw error;
         if (error instanceof ProviderError) {
           throw new AdvisorError(error.message, "provider_error");
@@ -260,23 +276,27 @@ export class AdvisorService {
           const repaired = await this.repairResponse(
             prompt.system,
             prompt.user,
-            responseText,
             signal,
           );
+          failures.push(...(repaired.failures ?? []));
           advice = parseAdviceResponse(repaired.text, {
             sessionId: request.sessionId,
             model: repaired.model,
             ...(repaired.usage ? { usage: repaired.usage } : {}),
           });
         } catch (repairError) {
+          if (signal?.aborted) throw new AdvisorError("Advisor request was cancelled", "cancelled");
+          const failedModels = failures.map((failure) => `${failure.model}: ${failure.reason}`).join("; ");
           throw new AdvisorError(
-            `Advisor returned an invalid response: ${
+            redactSecrets(`Advisor returned an invalid response: ${
               repairError instanceof Error ? repairError.message : String(repairError)
-            }`,
+            }${failedModels ? `; earlier failures: ${failedModels}` : ""}`, [this.config.apiKey, this.config.http.token]).text,
             "invalid_response",
           );
         }
       }
+
+      if (failures.length) advice.failures = failures;
 
       session.updatedAt = now();
       updateFromAdvice(session, request, advice);
@@ -296,9 +316,10 @@ export class AdvisorService {
     system: string,
     user: string,
     signal?: AbortSignal,
-  ): Promise<{ text: string; model: string; usage?: Advice["usage"] }> {
+  ): Promise<ProviderResponse> {
     let lastError: unknown;
     for (let attempt = 0; attempt < 3; attempt += 1) {
+      if (signal?.aborted) throw new AdvisorError("Advisor request was cancelled", "cancelled");
       try {
         return await this.provider.complete({
           system,
@@ -320,16 +341,11 @@ export class AdvisorService {
   private async repairResponse(
     originalSystem: string,
     originalUser: string,
-    invalidText: string,
     signal?: AbortSignal,
-  ): Promise<{ text: string; model: string; usage?: Advice["usage"] }> {
-    const clipped = invalidText.slice(0, 12_000);
+  ): Promise<ProviderResponse> {
     return this.requestWithRetry(
-      originalSystem,
-      `Your previous answer could not be parsed.\n\nOriginal task:\n${originalUser.slice(
-        0,
-        40_000,
-      )}\n\nPrevious answer:\n${clipped}\n\nReturn the corrected result as one JSON object matching the required schema.`,
+      `${originalSystem}\n\nYour previous answer could not be parsed. Return one valid JSON object matching the required schema.`,
+      originalUser,
       signal,
     );
   }

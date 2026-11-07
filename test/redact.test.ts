@@ -31,3 +31,9 @@ test("leaves ordinary code unchanged", () => {
   assert.equal(result.text, input);
   assert.equal(result.count, 0);
 });
+
+test("redacts JSON tool inputs and configured secrets before clipping", () => {
+  const result = redactSecrets('{"password":"correct-horse-battery-staple","api_key":"short-key"}', ["short-key"]);
+  assert.doesNotMatch(result.text, /correct-horse|short-key/);
+  assert.equal(result.count, 2);
+});

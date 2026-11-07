@@ -31,7 +31,7 @@ The design lesson is not "add a tool called advisor." It is:
 
 | Claude Code capability | Feasible over MCP? | Reason |
 | --- | --- | --- |
-| Advisor receives the full transcript automatically | No | The MCP server never sees host-internal messages. |
+| Advisor receives the full transcript automatically | No | MCP does not expose host-internal messages. Opt-in disk reads can provide bounded Claude Code session evidence. |
 | Advisor runs inside the same model request | No | MCP is an external tool call, not a server-side inference hook. |
 | Encrypted advisor result read by the executor | No | Requires provider-side integration. |
 | Main/advisor pairing enforcement | Partial | The server can document and validate configured model names, but cannot observe the host's executor model. |
@@ -68,9 +68,10 @@ The caller supplies a structured pack rather than a raw transcript dump:
 - `constraints`: non-negotiables;
 - `question`: the exact decision;
 - `context`: optional selected transcript;
+- `transcript_path`: optional Claude Code JSONL file within the server-configured projects root, gated by `ADVISOR_TRANSCRIPT_ENABLED`;
 - `options`: only when a decision is genuinely open.
 
-This is intentionally closer to a design review brief than a chat log. Full-transcript copying would be expensive, noisy, hard to redact, and likely to bury the decision.
+This is intentionally closer to a design review brief than a chat log. Opt-in disk context retains the first user message and newest turns, with the executor's `state` summary on top. The user evidence prompt has an estimated token budget (UTF-8 bytes / 3), not an exact model tokenizer. The legacy character setting remains an environment alias. See README for the verified Claude Code file format, root confinement and discovery limitations.
 
 ### Session state
 
@@ -100,6 +101,8 @@ The service depends on `AdvisorProvider.complete()`, not on an SDK. Two adapters
 
 This keeps the core testable with a fake provider and makes new adapters small. The OpenAI-compatible path deliberately covers local and gateway models as well as hosted APIs.
 
+`ADVISOR_MODELS` wraps the configured adapter in an ordered fallback chain using the same endpoint and credential. Transient/quota failures advance immediately; authentication and cancellation stop. Safe per-model failures accompany the answering model. Single-model configurations retain the existing retry loop. Repair retains the same evidence and can start another completion chain.
+
 ### Output contract
 
 The model returns JSON with:
@@ -117,6 +120,7 @@ The server validates and normalizes that shape. Invalid output gets one repair a
 - Common credentials are redacted before any provider request.
 - The server does not return provider error bodies beyond a bounded prefix.
 - The advisor never gets tools or file access.
+- The server's opt-in transcript reader only reads regular JSONL files confined to its configured root; that reader is never exposed as an advisor tool. Remote clients must be trusted before enabling it.
 - File-backed sessions are hashed by ID, stored with restrictive permissions, and should still be treated as sensitive.
 - HTTP bearer tokens are compared as SHA-256 digests with `timingSafeEqual`; the token itself is never logged.
 - `/healthz` reports only liveness and auth mode, never model or credential details.

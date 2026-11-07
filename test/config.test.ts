@@ -6,6 +6,19 @@ test("requires an explicit model id", () => {
   assert.throws(() => loadConfig({}), ConfigError);
 });
 
+test("loads ordered models and a token budget with legacy compatibility", () => {
+  const config = loadConfig({ ADVISOR_MODELS: "first, second", ADVISOR_MODEL: "ignored" });
+  assert.deepEqual(config.models, ["first", "second"]);
+  assert.equal(config.model, "first");
+  assert.equal(config.maxContextTokens, 30_000);
+  assert.equal(config.transcriptEnabled, false);
+  assert.equal(config.transcriptAutoDiscover, false);
+  assert.equal(loadConfig({ ADVISOR_MODEL: "m", ADVISOR_MAX_CONTEXT_CHARS: "8000" }).maxContextTokens, 2000);
+  assert.equal(loadConfig({ ADVISOR_MODEL: "m", ADVISOR_MAX_CONTEXT_CHARS: "8000", ADVISOR_MAX_CONTEXT_TOKENS: "1500" }).maxContextTokens, 1500);
+  assert.throws(() => loadConfig({ ADVISOR_MODELS: "first,,second" }), ConfigError);
+  assert.throws(() => loadConfig({ ADVISOR_MODEL: "m", ADVISOR_TRANSCRIPT_AUTO_DISCOVER: "true" }), ConfigError);
+});
+
 test("supports a keyless local OpenAI-compatible endpoint", () => {
   const config = loadConfig({
     ADVISOR_MODEL: "local-model",

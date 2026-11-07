@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { join } from "node:path";
+import { homedir } from "node:os";
 import { ConfigError, loadConfig } from "../src/config.js";
 
 const base = {
@@ -65,7 +67,7 @@ test("normalizes host and origin allowlists and expands home-relative data paths
   });
   assert.deepEqual(config.http.allowedHosts, ["advisor.example.com", "localhost"]);
   assert.deepEqual(config.http.allowedOrigins, ["console.example.com", "moz-extension://*"]);
-  assert.ok(config.dataDir.endsWith("/advisor-data"));
+  assert.equal(config.dataDir, join(homedir(), "advisor-data"));
   assert.doesNotMatch(config.dataDir, /^~/);
 });
 

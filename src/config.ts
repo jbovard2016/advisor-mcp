@@ -10,13 +10,17 @@ export interface AdvisorConfig {
   transport: TransportKind;
   provider: ProviderKind;
   model: string;
+  models: string[];
   apiKey: string;
   baseUrl: string;
   apiVersion: string;
   tokenParam: TokenParam;
   maxOutputTokens: number;
   timeoutMs: number;
-  maxContextChars: number;
+  maxContextTokens: number;
+  transcriptEnabled: boolean;
+  transcriptAutoDiscover: boolean;
+  transcriptProjectsDir: string;
   maxCallsPerSession: number;
   maxCallsPerMinute: number;
   dataDir: string;
@@ -252,9 +256,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AdvisorConfig 
     );
   }
 
-  const model = env.ADVISOR_MODEL?.trim();
+  const models = (env.ADVISOR_MODELS ?? env.ADVISOR_MODEL ?? "").split(",").map((model) => model.trim());
+  const model = models[0];
   if (!model) {
-    throw new ConfigError("Missing ADVISOR_MODEL (for example, the model ID exposed by your provider)");
+    throw new ConfigError("Missing ADVISOR_MODEL or ADVISOR_MODELS (use model IDs exposed by your provider)");
+  }
+  if (models.some((item) => !item) || models.length > 10) {
+    throw new ConfigError("ADVISOR_MODELS must contain 1-10 non-empty comma-separated model IDs");
+  }
+  const transcriptEnabled = parseBoolean("ADVISOR_TRANSCRIPT_ENABLED", env.ADVISOR_TRANSCRIPT_ENABLED, false);
+  const transcriptAutoDiscover = parseBoolean("ADVISOR_TRANSCRIPT_AUTO_DISCOVER", env.ADVISOR_TRANSCRIPT_AUTO_DISCOVER, false);
+  if (transcriptAutoDiscover && !transcriptEnabled) {
+    throw new ConfigError("ADVISOR_TRANSCRIPT_AUTO_DISCOVER requires ADVISOR_TRANSCRIPT_ENABLED=true");
   }
 
   const apiKey =
@@ -269,6 +282,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AdvisorConfig 
     transport,
     provider,
     model,
+    models,
     apiKey,
     baseUrl: baseUrl.replace(/\/+$/, ""),
     apiVersion: env.ADVISOR_API_VERSION?.trim() || "2023-06-01",
@@ -283,12 +297,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AdvisorConfig 
       min: 1_000,
       max: 300_000,
     }),
-    maxContextChars: parsePositiveInt(
-      "ADVISOR_MAX_CONTEXT_CHARS",
-      env.ADVISOR_MAX_CONTEXT_CHARS,
-      120_000,
-      { min: 4_000, max: 2_000_000 },
+    maxContextTokens: parsePositiveInt(
+      "ADVISOR_MAX_CONTEXT_TOKENS",
+      env.ADVISOR_MAX_CONTEXT_TOKENS,
+      env.ADVISOR_MAX_CONTEXT_TOKENS?.trim() ? 30_000 : Math.floor(parsePositiveInt(
+        "ADVISOR_MAX_CONTEXT_CHARS", env.ADVISOR_MAX_CONTEXT_CHARS, 120_000,
+        { min: 4_000, max: 2_000_000 },
+      ) / 4),
+      { min: 1_000, max: 500_000 },
     ),
+    transcriptEnabled,
+    transcriptAutoDiscover,
+    transcriptProjectsDir: expandHomePath(env.ADVISOR_TRANSCRIPT_PROJECTS_DIR?.trim() || join(homedir(), ".claude", "projects")),
     maxCallsPerSession: parsePositiveInt(
       "ADVISOR_MAX_CALLS_PER_SESSION",
       env.ADVISOR_MAX_CALLS_PER_SESSION,
@@ -315,11 +335,14 @@ export function redactedConfigSummary(config: AdvisorConfig): Record<string, unk
     provider: config.provider,
     transport: config.transport,
     model: config.model,
+    models: config.models,
     baseUrl: config.baseUrl,
     maxOutputTokens: config.maxOutputTokens,
     timeoutMs: config.timeoutMs,
     tokenParam: config.tokenParam,
-    maxContextChars: config.maxContextChars,
+    maxContextTokens: config.maxContextTokens,
+    transcriptEnabled: config.transcriptEnabled,
+    transcriptAutoDiscover: config.transcriptAutoDiscover,
     maxCallsPerSession: config.maxCallsPerSession,
     maxCallsPerMinute: config.maxCallsPerMinute,
     store: config.store,

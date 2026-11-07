@@ -3,7 +3,7 @@ import { request as httpRequest } from "node:http";
 import test from "node:test";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { AdvisorService } from "../src/advisor.js";
-import type { AdvisorConfig } from "../src/config.js";
+import { loadConfig, type AdvisorConfig } from "../src/config.js";
 import { startHttpServer } from "../src/http.js";
 import { MemorySessionStore } from "../src/store.js";
 import type { AdvisorProvider, ProviderRequest, ProviderResponse } from "../src/types.js";
@@ -28,6 +28,7 @@ class StaticProvider implements AdvisorProvider {
 
 function config(overrides: Partial<AdvisorConfig> = {}): AdvisorConfig {
   return {
+    ...loadConfig({ ADVISOR_MODEL: "static-model" }),
     transport: "http",
     provider: "openai-compatible",
     model: "static-model",
@@ -37,7 +38,7 @@ function config(overrides: Partial<AdvisorConfig> = {}): AdvisorConfig {
     tokenParam: "max_completion_tokens",
     maxOutputTokens: 500,
     timeoutMs: 5_000,
-    maxContextChars: 50_000,
+    maxContextTokens: 16_666,
     maxCallsPerSession: 5,
     maxCallsPerMinute: 10,
     dataDir: "/tmp/advisor-test",

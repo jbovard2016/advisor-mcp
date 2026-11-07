@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import test from "node:test";
-import type { AdvisorConfig } from "../src/config.js";
-import { AnthropicProvider, OpenAICompatibleProvider } from "../src/providers.js";
+import { loadConfig, type AdvisorConfig } from "../src/config.js";
+import { AnthropicProvider, createProvider, OpenAICompatibleProvider, ProviderError } from "../src/providers.js";
 
 async function withServer(
   handler: (req: IncomingMessage, res: ServerResponse, body: string) => void,
@@ -30,33 +30,9 @@ async function withServer(
 
 function config(baseUrl: string, overrides: Partial<AdvisorConfig> = {}): AdvisorConfig {
   return {
-    provider: "openai-compatible",
-    model: "test-model",
-    apiKey: "test-key",
-    baseUrl,
-    apiVersion: "2023-06-01",
-    tokenParam: "max_completion_tokens",
+    ...loadConfig({ ADVISOR_MODEL: "test-model", ADVISOR_API_KEY: "test-key", ADVISOR_BASE_URL: baseUrl }),
     maxOutputTokens: 800,
     timeoutMs: 5_000,
-    maxContextChars: 10_000,
-    maxCallsPerSession: 5,
-    maxCallsPerMinute: 10,
-    dataDir: "/tmp/unused",
-    store: "memory",
-    defaultAdviceStyle: "brief",
-    http: {
-      host: "127.0.0.1",
-      port: 8787,
-      path: "/mcp",
-      token: "",
-      allowUnauthenticatedLoopback: true,
-      allowedOrigins: [],
-      allowedHosts: [],
-      maxBodyBytes: 1_048_576,
-      maxConcurrentRequests: 8,
-      requestsPerMinute: 120,
-      trustProxy: false,
-    },
     ...overrides,
   };
 }
@@ -169,4 +145,133 @@ test("provider surfaces HTTP errors without leaking the key", async () => {
       );
     },
   );
+});
+
+test("fallback tries the next model on rate limit and reports safe failure details", async () => {
+  const seen: string[] = [];
+  await withServer((_req, res, body) => {
+    const { model } = JSON.parse(body);
+    seen.push(model);
+    if (model === "first") {
+      res.writeHead(429);
+      res.end('{"error":"test-key private text"}');
+    } else {
+      res.end(JSON.stringify({ choices: [{ message: { content: "ok" } }] }));
+    }
+  }, async (baseUrl) => {
+    const provider = createProvider(config(baseUrl, { models: ["first", "second"] }));
+    const result = await provider.complete({ system: "s", user: "u", maxOutputTokens: 100 });
+    assert.deepEqual(seen, ["first", "second"]);
+    assert.equal(result.model, "second");
+    assert.deepEqual(result.failures, [{ model: "first", reason: "HTTP 429" }]);
+    assert.doesNotMatch(JSON.stringify(result.failures), /test-key|private text/);
+  });
+});
+
+test("fallback exhausts once and does not expose provider response bodies", async () => {
+  let calls = 0;
+  await withServer((_req, res) => {
+    calls++;
+    res.writeHead(503);
+    res.end("private upstream details test-key");
+  }, async (baseUrl) => {
+    const provider = createProvider(config(baseUrl, { models: ["first", "second"] }));
+    await assert.rejects(provider.complete({ system: "s", user: "u", maxOutputTokens: 100 }), (error: unknown) => {
+      assert.ok(error instanceof ProviderError);
+      assert.equal(error.retryable, false);
+      assert.match(error.message, /first.*HTTP 503.*second.*HTTP 503/);
+      assert.doesNotMatch(error.message, /private|test-key/);
+      return true;
+    });
+    assert.equal(calls, 2);
+  });
+});
+
+test("fallback stops on authentication failures and cancellation", async () => {
+  let calls = 0;
+  await withServer((_req, res) => {
+    calls++;
+    res.writeHead(401);
+    res.end("unauthorized");
+  }, async (baseUrl) => {
+    const provider = createProvider(config(baseUrl, { models: ["first", "second"] }));
+    await assert.rejects(provider.complete({ system: "s", user: "u", maxOutputTokens: 100 }), /HTTP 401/);
+    assert.equal(calls, 1);
+    const controller = new AbortController();
+    controller.abort();
+    await assert.rejects(provider.complete({ system: "s", user: "u", maxOutputTokens: 100, signal: controller.signal }), /cancelled/);
+    assert.equal(calls, 1);
+  });
+});
+
+test("fallback recognizes structured quota errors and works with Anthropic", async () => {
+  const seen: string[] = [];
+  await withServer((_req, res, body) => {
+    const { model } = JSON.parse(body);
+    seen.push(model);
+    if (model === "first") {
+      res.writeHead(403);
+      res.end(JSON.stringify({ error: { code: "insufficient_quota" } }));
+    } else {
+      res.end(JSON.stringify({ content: [{ type: "text", text: "ok" }] }));
+    }
+  }, async (baseUrl) => {
+    const provider = createProvider(config(baseUrl, { provider: "anthropic", models: ["first", "second"] }));
+    const result = await provider.complete({ system: "s", user: "u", maxOutputTokens: 100 });
+    assert.deepEqual(seen, ["first", "second"]);
+    assert.equal(result.model, "second");
+    assert.deepEqual(result.failures, [{ model: "first", reason: "quota exceeded" }]);
+  });
+});
+
+test("fallback handles timeout while reading the response body", async () => {
+  const seen: string[] = [];
+  await withServer((_req, res, body) => {
+    const { model } = JSON.parse(body);
+    seen.push(model);
+    if (model === "first") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.write('{"choices":');
+      setTimeout(() => res.end('[]}'), 100);
+    } else {
+      res.end(JSON.stringify({ choices: [{ message: { content: "ok" } }] }));
+    }
+  }, async (baseUrl) => {
+    const provider = createProvider(config(baseUrl, { models: ["first", "second"], timeoutMs: 30 }));
+    const result = await provider.complete({ system: "s", user: "u", maxOutputTokens: 100 });
+    assert.deepEqual(seen, ["first", "second"]);
+    assert.deepEqual(result.failures, [{ model: "first", reason: "timeout" }]);
+  });
+});
+
+test("fallback handles quota status but stops on an unrelated 400", async () => {
+  const seen: string[] = [];
+  await withServer((_req, res, body) => {
+    const { model } = JSON.parse(body);
+    seen.push(model);
+    res.writeHead(model === "first" ? 402 : 400);
+    res.end("sensitive upstream details");
+  }, async (baseUrl) => {
+    const provider = createProvider(config(baseUrl, { models: ["first", "second", "third"] }));
+    await assert.rejects(provider.complete({ system: "s", user: "u", maxOutputTokens: 100 }), (error: unknown) => {
+      assert.ok(error instanceof ProviderError);
+      assert.match(error.message, /first.*quota exceeded.*second.*HTTP 400/);
+      assert.doesNotMatch(error.message, /sensitive/);
+      return true;
+    });
+    assert.deepEqual(seen, ["first", "second"]);
+  });
+});
+
+test("redacts the configured key in a provider refusal", async () => {
+  await withServer((_req, res) => {
+    res.end(JSON.stringify({ choices: [{ message: { refusal: "test-key" } }] }));
+  }, async (baseUrl) => {
+    const provider = new OpenAICompatibleProvider(config(baseUrl));
+    await assert.rejects(provider.complete({ system: "s", user: "u", maxOutputTokens: 100 }), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.doesNotMatch(error.message, /test-key/);
+      return true;
+    });
+  });
 });

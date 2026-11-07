@@ -101,6 +101,7 @@ export function formatAdvice(advice: Advice): string {
   add("Risks", advice.risks);
   add("Next actions", advice.nextActions);
   add("Evidence gaps", advice.evidenceGaps);
+  add("Failed advisor models", (advice.failures ?? []).map((failure) => `${failure.model}: ${failure.reason}`));
   lines.push(
     "",
     `consult_id: ${advice.consultId}`,

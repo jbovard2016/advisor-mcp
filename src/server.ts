@@ -41,6 +41,7 @@ const consultSchema = z.object({
     .max(12_000)
     .optional()
     .describe("Current progress, observed behavior, and what has already been tried."),
+  transcript_path: z.string().min(1).max(4_096).optional().describe("Opt-in Claude Code .jsonl transcript inside ADVISOR_TRANSCRIPT_PROJECTS_DIR. Requires ADVISOR_TRANSCRIPT_ENABLED=true. Omit to use configured auto-discovery."),
   attempt: z
     .string()
     .max(12_000)
@@ -95,6 +96,7 @@ function toConsultRequest(input: {
   question: string;
   goal?: string | undefined;
   state?: string | undefined;
+  transcript_path?: string | undefined;
   attempt?: string | undefined;
   expected_outcome?: string | undefined;
   constraints?: string[] | undefined;
@@ -112,6 +114,7 @@ function toConsultRequest(input: {
     question: input.question,
     ...(input.goal !== undefined ? { goal: input.goal } : {}),
     ...(input.state !== undefined ? { state: input.state } : {}),
+    ...(input.transcript_path !== undefined ? { transcriptPath: input.transcript_path } : {}),
     ...(input.attempt !== undefined ? { attempt: input.attempt } : {}),
     ...(input.expected_outcome !== undefined ? { expectedOutcome: input.expected_outcome } : {}),
     ...(input.constraints !== undefined ? { constraints: input.constraints } : {}),
@@ -290,11 +293,14 @@ export function createAdvisorServer(
         credentials: config.apiKey ? "configured" : "not_required_or_missing",
         provider: config.provider,
         model: config.model,
+        models: config.models,
         baseUrl: config.baseUrl,
         store: config.store,
         maxCallsPerSession: config.maxCallsPerSession,
         maxCallsPerMinute: config.maxCallsPerMinute,
-        maxContextChars: config.maxContextChars,
+        maxContextTokens: config.maxContextTokens,
+        transcriptEnabled: config.transcriptEnabled,
+        transcriptAutoDiscover: config.transcriptAutoDiscover,
         defaultAdviceStyle: config.defaultAdviceStyle,
         tokenParam: config.tokenParam,
         transport: config.transport,

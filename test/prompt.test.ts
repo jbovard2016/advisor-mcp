@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { buildPrompt, ADVISOR_SYSTEM_PROMPT } from "../src/prompt.js";
+import { estimateTokens } from "../src/context-budget.js";
 import type { SessionState } from "../src/types.js";
 
 function session(): SessionState {
@@ -31,7 +32,7 @@ test("builds an evidence-oriented prompt without prior history when disabled", (
     },
     session: session(),
     style: "brief",
-    maxContextChars: 10_000,
+    maxContextTokens: 3_333,
   });
 
   assert.equal(result.system, ADVISOR_SYSTEM_PROMPT);
@@ -52,7 +53,7 @@ test("preserves both ends of oversized context and warns about truncation", () =
     },
     session: session(),
     style: "detailed",
-    maxContextChars: 4_000,
+    maxContextTokens: 1_333,
   });
 
   assert.equal(result.truncated, true);
@@ -71,7 +72,7 @@ test("redacts secrets before they reach the prompt", () => {
     },
     session: session(),
     style: "brief",
-    maxContextChars: 10_000,
+    maxContextTokens: 3_333,
   });
   assert.equal(result.redactions, 1);
   assert.doesNotMatch(result.user, /abcdefghijklmnopqrstuvwxyz123456/);
@@ -108,10 +109,30 @@ test("treats a zero history limit as no context or prior turns", () => {
     },
     session: state,
     style: "brief",
-    maxContextChars: 10_000,
+    maxContextTokens: 3_333,
   });
 
   assert.doesNotMatch(result.user, /Transcript that should not be included/);
   assert.doesNotMatch(result.user, /Prior summary/);
   assert.match(result.user, /Current question/);
+});
+
+test("token budget keeps the summary, full first user message and newest tool output", () => {
+  const result = buildPrompt({
+    request: { sessionId: "test", kind: "review", question: "Review", state: "SUMMARY ON TOP" },
+    session: session(), style: "brief", maxContextTokens: 1000,
+    transcript: {
+      firstUser: "FIRST USER GOAL", truncated: false,
+      messages: [
+        { role: "assistant", content: "OLD TURN " + "字".repeat(5000) },
+        { role: "tool", content: "NEWEST TOOL EVIDENCE 😀" },
+      ],
+    },
+  });
+  assert.ok(estimateTokens(result.user) <= 1000);
+  assert.match(result.user, /^## Agent summary\nSUMMARY ON TOP/);
+  assert.match(result.user, /FIRST USER GOAL/);
+  assert.match(result.user, /NEWEST TOOL EVIDENCE 😀/);
+  assert.doesNotMatch(result.user, /OLD TURN/);
+  assert.equal(result.truncated, true);
 });

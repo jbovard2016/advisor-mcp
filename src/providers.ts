@@ -1,6 +1,6 @@
 import type { AdvisorConfig } from "./config.js";
 import { redactSecrets } from "./redact.js";
-import type { AdvisorProvider, ProviderRequest, ProviderResponse, Usage } from "./types.js";
+import type { AdvisorProvider, ModelFailure, ProviderRequest, ProviderResponse, Usage } from "./types.js";
 
 interface OpenAIResponse {
   choices?: Array<{
@@ -22,6 +22,7 @@ export class ProviderError extends Error {
     message: string,
     readonly status?: number,
     readonly retryable = false,
+    readonly reason?: string,
   ) {
     super(message);
     this.name = "ProviderError";
@@ -62,32 +63,40 @@ async function requestJson<T>(
   const timeout = AbortSignal.timeout(timeoutMs);
   const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
 
-  let response: Response;
   try {
-    response = await fetch(url, { ...init, signal: combined });
-  } catch (error) {
-    if (timeout.aborted) {
-      throw new ProviderError(`Provider request timed out after ${timeoutMs}ms`, undefined, true);
+    const response = await fetch(url, { ...init, signal: combined });
+    if (!response.ok) {
+      const body = await response.text();
+      let code: unknown;
+      try {
+        const parsed = JSON.parse(body) as { error?: { code?: unknown; type?: unknown } };
+        code = parsed.error?.code ?? parsed.error?.type;
+      } catch { /* Non-JSON errors are still reported by status. */ }
+      const quota = response.status === 402 ||
+        ((response.status === 400 || response.status === 403) &&
+          (code === "insufficient_quota" || code === "quota_exceeded"));
+      const safeBody = redactProviderText(body, secrets).slice(0, 800);
+      throw new ProviderError(
+        `Provider returned HTTP ${response.status}${safeBody ? `: ${safeBody}` : ""}`,
+        response.status,
+        quota || response.status === 408 || response.status === 409 || response.status === 429 || response.status >= 500,
+        quota ? "quota exceeded" : `HTTP ${response.status}`,
+      );
     }
+    return (await response.json()) as T;
+  } catch (error) {
     if (signal?.aborted) throw new ProviderError("Advisor request was cancelled");
+    if (timeout.aborted) {
+      throw new ProviderError(`Provider request timed out after ${timeoutMs}ms`, undefined, true, "timeout");
+    }
+    if (error instanceof ProviderError || error instanceof SyntaxError) throw error;
     throw new ProviderError(
-      `Provider request failed: ${error instanceof Error ? error.message : String(error)}`,
+      `Provider request failed: ${redactProviderText(error instanceof Error ? error.message : String(error), secrets)}`,
       undefined,
       true,
+      "network error",
     );
   }
-
-  if (!response.ok) {
-    const body = (await response.text().catch(() => "")).slice(0, 800);
-    const safeBody = redactProviderText(body, secrets);
-    throw new ProviderError(
-      `Provider returned HTTP ${response.status}${safeBody ? `: ${safeBody}` : ""}`,
-      response.status,
-      response.status === 408 || response.status === 409 || response.status === 429 || response.status >= 500,
-    );
-  }
-
-  return (await response.json()) as T;
 }
 
 function redactProviderText(text: string, secrets: string[]): string {
@@ -129,7 +138,7 @@ export class OpenAICompatibleProvider implements AdvisorProvider {
     const message = data.choices?.[0]?.message;
     const text = openAIText(message?.content).trim();
     if (!text) {
-      const detail = message?.refusal ? `: ${message.refusal}` : "";
+      const detail = message?.refusal ? `: ${redactProviderText(message.refusal, [this.config.apiKey])}` : "";
       throw new ProviderError(`Provider returned an empty response${detail}`);
     }
 
@@ -203,7 +212,31 @@ export class AnthropicProvider implements AdvisorProvider {
 }
 
 export function createProvider(config: AdvisorConfig): AdvisorProvider {
-  return config.provider === "anthropic"
-    ? new AnthropicProvider(config)
-    : new OpenAICompatibleProvider(config);
+  const models = config.models ?? [config.model];
+  const providers = models.map((model) => {
+    const modelConfig = { ...config, model };
+    return config.provider === "anthropic"
+      ? new AnthropicProvider(modelConfig)
+      : new OpenAICompatibleProvider(modelConfig);
+  });
+  if (providers.length === 1) return providers[0]!;
+  return {
+    name: config.provider,
+    async complete(request) {
+      const failures: ModelFailure[] = [];
+      for (let i = 0; i < providers.length; i++) {
+        try {
+          const result = await providers[i]!.complete(request);
+          return { ...result, ...(failures.length ? { failures } : {}) };
+        } catch (error) {
+          if (!(error instanceof ProviderError) || request.signal?.aborted) throw error;
+          failures.push({ model: models[i]!, reason: error.reason ?? "provider error" });
+          if (!error.retryable) {
+            throw new ProviderError(`Advisor model failed: ${failures.map((f) => `${f.model}: ${f.reason}`).join(", ")}`, error.status);
+          }
+        }
+      }
+      throw new ProviderError(`All advisor models failed: ${failures.map((f) => `${f.model}: ${f.reason}`).join(", ")}`);
+    },
+  };
 }

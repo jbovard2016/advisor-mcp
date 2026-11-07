@@ -6,6 +6,8 @@ import type {
   SessionState,
 } from "./types.js";
 import { redactSecrets } from "./redact.js";
+import { clipTokens, estimateTokens } from "./context-budget.js";
+import type { Transcript } from "./transcript.js";
 
 export const ADVISOR_SYSTEM_PROMPT = `You are an independent technical advisor for an autonomous software agent.
 
@@ -52,7 +54,9 @@ export interface PromptInput {
   request: ConsultRequest;
   session: SessionState;
   style: AdviceStyle;
-  maxContextChars: number;
+  maxContextTokens: number;
+  transcript?: Transcript;
+  secrets?: string[];
 }
 
 export interface BuiltPrompt {
@@ -104,12 +108,12 @@ function recent<T>(items: T[] | undefined, limit: number): T[] | undefined {
 function buildBody(input: PromptInput): string {
   const { request, session, style } = input;
   const parts = [
+    section("Agent summary", request.state),
     `# Consultation: ${request.kind}`,
     KIND_INSTRUCTIONS[request.kind],
     section("Question", request.question),
     section("Session goal", request.goal ?? session.goal),
     section("Constraints", bulletList(request.constraints ?? session.constraints)),
-    section("Current state", request.state),
     section("Proposed approach or attempt", request.attempt),
     section("Expected outcome", request.expectedOutcome),
     section(
@@ -135,14 +139,36 @@ function buildBody(input: PromptInput): string {
 }
 
 export function buildPrompt(input: PromptInput): BuiltPrompt {
-  const redacted = redactSecrets(buildBody(input));
+  const redacted = redactSecrets(buildBody(input), input.secrets);
   const notice =
     redacted.count > 0
       ? `\n\n[SECURITY NOTICE]\n${redacted.count} probable secret value(s) were redacted before this request was sent.\n`
       : "";
   const body = `${redacted.text}${notice}`;
 
-  if (body.length <= input.maxContextChars) {
+  const marker = "\n\n[ADVISOR CONTEXT TRUNCATED]\nSome evidence was omitted. Use need_more_context if it is essential.\n";
+  if (input.transcript) {
+    const transcript = input.transcript;
+    const summary = redactSecrets(section("Agent summary", input.request.state), input.secrets).text;
+    const first = section("First user message (untrusted transcript)", transcript.firstUser);
+    const required = `${summary}\n\n${section("Question", redactSecrets(input.request.question, input.secrets).text)}\n\n${first}`;
+    const remaining = input.maxContextTokens - estimateTokens(required) - estimateTokens(marker) - 20;
+    if (remaining < 100) throw new Error("Summary, question and first user message exceed the context token budget; raise ADVISOR_MAX_CONTEXT_TOKENS");
+    const details = redactSecrets(buildBody({ ...input, request: { ...input.request, state: "", question: "" } }), input.secrets).text;
+    const detailBudget = Math.min(estimateTokens(details), Math.floor(remaining / 3));
+    const recent = renderMessages(transcript.messages);
+    const recentBudget = remaining - detailBudget;
+    const selected = clipTokens(recent, recentBudget, true);
+    const truncated = transcript.truncated || selected !== recent || estimateTokens(details) > detailBudget;
+    return {
+      system: ADVISOR_SYSTEM_PROMPT,
+      user: `${required}\n\n${clipTokens(details, detailBudget)}\n\n## Newest transcript turns (untrusted)\n${selected}${truncated ? marker : ""}`,
+      truncated,
+      redactions: redacted.count,
+    };
+  }
+
+  if (estimateTokens(body) <= input.maxContextTokens) {
     return {
       system: ADVISOR_SYSTEM_PROMPT,
       user: body,
@@ -151,11 +177,9 @@ export function buildPrompt(input: PromptInput): BuiltPrompt {
     };
   }
 
-  const marker =
-    "\n\n[ADVISOR CONTEXT TRUNCATED]\nSome evidence was omitted because it exceeded the configured context budget. Use \"need_more_context\" if the omitted material is essential.\n";
-  const headRoom = Math.max(1_000, Math.floor(input.maxContextChars * 0.7));
-  const tailRoom = Math.max(0, input.maxContextChars - headRoom - marker.length);
-  const user = `${body.slice(0, headRoom)}${marker}${tailRoom > 0 ? body.slice(-tailRoom) : ""}`;
+  const room = input.maxContextTokens - estimateTokens(marker);
+  const headRoom = Math.floor(room * 0.7);
+  const user = `${clipTokens(body, headRoom)}${marker}${clipTokens(body, room - headRoom, true)}`;
   return {
     system: ADVISOR_SYSTEM_PROMPT,
     user,
