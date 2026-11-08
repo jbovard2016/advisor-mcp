@@ -275,3 +275,30 @@ test("redacts the configured key in a provider refusal", async () => {
     });
   });
 });
+
+test("reasoning effort is sent only when ADVISOR_REASONING_EFFORT is set, and invalid values are rejected", async () => {
+  const seen: Array<unknown> = [];
+  await withServer(
+    (_req, res, body) => {
+      seen.push(JSON.parse(body).reasoning_effort);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ choices: [{ message: { content: "ok" } }] }));
+    },
+    async (baseUrl) => {
+      const request = { system: "s", user: "u", maxOutputTokens: 800 };
+      await new OpenAICompatibleProvider(config(baseUrl)).complete(request);
+      const withEffort = loadConfig({
+        ADVISOR_MODEL: "test-model",
+        ADVISOR_API_KEY: "test-key",
+        ADVISOR_BASE_URL: baseUrl,
+        ADVISOR_REASONING_EFFORT: "Medium",
+      });
+      await new OpenAICompatibleProvider({ ...withEffort, timeoutMs: 5_000 }).complete(request);
+    },
+  );
+  assert.deepEqual(seen, [undefined, "medium"]);
+  assert.throws(
+    () => loadConfig({ ADVISOR_MODEL: "m", ADVISOR_REASONING_EFFORT: "extreme" }),
+    /ADVISOR_REASONING_EFFORT must be one of/,
+  );
+});

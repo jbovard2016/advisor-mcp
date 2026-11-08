@@ -169,6 +169,20 @@ export ADVISOR_MODELS=first-model,second-model,third-model
 
 `ADVISOR_MODELS` accepts 1-10 comma-separated model IDs in priority order and takes precedence over `ADVISOR_MODEL`. All entries use the same configured provider, base URL and credential, so a model gateway can route them to different backends. Without the list, `ADVISOR_MODEL` keeps its existing behavior.
 
+### ProxyPilot preset (OpenAI-compatible gateway)
+
+`ADVISOR_REASONING_EFFORT` (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`) is sent as `reasoning_effort` on OpenAI-compatible requests; when unset, nothing is sent. A gateway such as ProxyPilot (`http://127.0.0.1:8317/v1`) can serve every fallback model from one endpoint and key:
+
+```bash
+export ADVISOR_PROVIDER=openai-compatible
+export ADVISOR_BASE_URL=http://127.0.0.1:8317/v1
+export ADVISOR_API_KEY="$PROXYPILOT_API_KEY"
+export ADVISOR_MODELS=gpt-6-astra,glm/glm-5.3,gpt-6.1-sol
+export ADVISOR_REASONING_EFFORT=medium
+```
+
+Model IDs must come from the gateway's live `/v1/models` list. The effort applies to every model in the list; a model that rejects the field fails that attempt and the chain moves on.
+
 The next model is tried immediately on HTTP 429, 5xx, 408/409, quota exhaustion (402 or structured `insufficient_quota`/`quota_exceeded` on 400/403), network failures and request/body timeouts. Cancellation, authentication failures and other non-transient errors stop the chain. Each chain entry is attempted once per completion; a single-model configuration retains the existing transient retries. One invalid advice response may trigger a repair completion with the same bounded evidence, starting the chain again. A consult still consumes one session call, although several provider requests may be made.
 
 Successful MCP results include `advisorModel` and, when applicable, `failures: [{ model, reason }]`; the text result lists failed models too. Exhaustion reports all attempted models. Failure reasons use fixed categories/status codes and exclude provider response bodies, credentials and URLs. A shared bad key cannot be repaired by switching models; it remains a terminal error. Worst-case latency grows with the number of models and per-attempt timeout.

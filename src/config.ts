@@ -5,6 +5,8 @@ import { join } from "node:path";
 export type ProviderKind = "openai-compatible" | "anthropic";
 export type TokenParam = "max_completion_tokens" | "max_tokens";
 export type TransportKind = "stdio" | "http";
+export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
+const REASONING_EFFORTS: readonly string[] = ["none", "minimal", "low", "medium", "high", "xhigh"];
 
 export interface AdvisorConfig {
   transport: TransportKind;
@@ -15,6 +17,8 @@ export interface AdvisorConfig {
   baseUrl: string;
   apiVersion: string;
   tokenParam: TokenParam;
+  /** Sent as `reasoning_effort` on openai-compatible requests when set. */
+  reasoningEffort?: ReasoningEffort;
   maxOutputTokens: number;
   timeoutMs: number;
   maxContextTokens: number;
@@ -256,6 +260,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AdvisorConfig 
     );
   }
 
+  const effort = env.ADVISOR_REASONING_EFFORT?.trim().toLowerCase();
+  if (effort && !REASONING_EFFORTS.includes(effort)) {
+    throw new ConfigError(`ADVISOR_REASONING_EFFORT must be one of: ${REASONING_EFFORTS.join(", ")}`);
+  }
+
   const models = (env.ADVISOR_MODELS ?? env.ADVISOR_MODEL ?? "").split(",").map((model) => model.trim());
   const model = models[0];
   if (!model) {
@@ -287,6 +296,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AdvisorConfig 
     baseUrl: baseUrl.replace(/\/+$/, ""),
     apiVersion: env.ADVISOR_API_VERSION?.trim() || "2023-06-01",
     tokenParam,
+    ...(effort ? { reasoningEffort: effort as ReasoningEffort } : {}),
     maxOutputTokens: parsePositiveInt(
       "ADVISOR_MAX_OUTPUT_TOKENS",
       env.ADVISOR_MAX_OUTPUT_TOKENS,

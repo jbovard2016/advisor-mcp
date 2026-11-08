@@ -124,6 +124,7 @@ export class OpenAICompatibleProvider implements AdvisorProvider {
         body: JSON.stringify({
           model: this.config.model,
           [this.config.tokenParam]: request.maxOutputTokens,
+          ...(this.config.reasoningEffort ? { reasoning_effort: this.config.reasoningEffort } : {}),
           messages: [
             { role: "system", content: request.system },
             { role: "user", content: request.user },
