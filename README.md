@@ -177,11 +177,11 @@ export ADVISOR_MODELS=first-model,second-model,third-model
 export ADVISOR_PROVIDER=openai-compatible
 export ADVISOR_BASE_URL=http://127.0.0.1:8317/v1
 export ADVISOR_API_KEY="$PROXYPILOT_API_KEY"
-export ADVISOR_MODELS=gpt-6-astra,glm/glm-5.3,gpt-6.1-sol
+export ADVISOR_MODELS=gpt-6-astra,gpt-6.1-sol,claude-opus-5-5
 export ADVISOR_REASONING_EFFORT=medium
 ```
 
-Model IDs must come from the gateway's live `/v1/models` list. The effort applies to every model in the list; a model that rejects the field fails that attempt and the chain moves on.
+Model IDs must come from the gateway's live `/v1/models` list. The effort applies to every model in the list; a model that rejects the field fails that attempt and the chain moves on. Observed on ProxyPilot: `glm/glm-5.3` rejects `medium` (HTTP 400, accepts only low, high or max), so keep GLM out of a medium-effort chain; `gpt-6-astra`, `gpt-6.1-sol` and `claude-opus-5-5` accepted it.
 
 The next model is tried immediately on HTTP 429, 5xx, 408/409, quota exhaustion (402 or structured `insufficient_quota`/`quota_exceeded` on 400/403), network failures and request/body timeouts. Cancellation, authentication failures and other non-transient errors stop the chain. Each chain entry is attempted once per completion; a single-model configuration retains the existing transient retries. One invalid advice response may trigger a repair completion with the same bounded evidence, starting the chain again. A consult still consumes one session call, although several provider requests may be made.
 
