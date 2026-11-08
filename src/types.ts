@@ -70,6 +70,8 @@ export interface StoredTurn {
 
 export interface SessionState {
   id: string;
+  /** Folder the server was launched from (the host's project folder); lets a file store show which repo consulted. */
+  cwd?: string;
   createdAt: string;
   updatedAt: string;
   calls: number;

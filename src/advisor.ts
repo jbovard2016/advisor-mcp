@@ -65,6 +65,7 @@ function newSession(id: string): SessionState {
   const timestamp = now();
   return {
     id,
+    cwd: process.cwd(),
     createdAt: timestamp,
     updatedAt: timestamp,
     calls: 0,
